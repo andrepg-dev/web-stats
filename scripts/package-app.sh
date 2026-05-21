@@ -2,7 +2,6 @@
 set -euo pipefail
 
 swift build -c release --product web-stats
-swift build -c release --product web-stats-agent
 
 APP_DIR=".build/web-stats.app"
 CONTENTS_DIR="$APP_DIR/Contents"
@@ -11,7 +10,6 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR"
 cp ".build/release/web-stats" "$MACOS_DIR/web-stats"
-cp ".build/release/web-stats-agent" "$MACOS_DIR/web-stats-agent"
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

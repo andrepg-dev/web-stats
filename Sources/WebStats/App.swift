@@ -7,24 +7,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
     private var tracker: BraveTracker?
-    private var backgroundAgent: BackgroundAgentController?
     private var menuBarLoginItem: MenuBarLoginItemController?
     private var titleTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        let tracker = BraveTracker(mode: .viewer)
-        let backgroundAgent = BackgroundAgentController()
+        let tracker = BraveTracker()
         let menuBarLoginItem = MenuBarLoginItemController()
         self.tracker = tracker
-        self.backgroundAgent = backgroundAgent
         self.menuBarLoginItem = menuBarLoginItem
         menuBarLoginItem.ensureInstalled()
+        LegacyTrackerCleanup.removeObsoleteArtifacts()
 
         let content = MenuBarDashboard()
             .environmentObject(tracker)
-            .environmentObject(backgroundAgent)
             .frame(width: 420, height: 560)
 
         let hostingController = NSHostingController(rootView: content)
@@ -34,7 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentSize = NSSize(width: 420, height: 560)
         self.popover = popover
 
-        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.isVisible = true
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
@@ -42,7 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         icon?.isTemplate = true
         statusItem.button?.image = icon
         statusItem.button?.imageScaling = .scaleProportionallyDown
-        statusItem.button?.imagePosition = .imageLeft
+        statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.toolTip = "web-stats"
         if icon == nil {
             statusItem.button?.title = "WS"
@@ -52,8 +49,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateStatusTitle()
         titleTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.tracker?.refreshNow()
-                self?.backgroundAgent?.refresh()
                 self?.updateStatusTitle()
             }
         }
@@ -84,55 +79,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusTitle() {
         guard let button = statusItem?.button else { return }
-        button.title = " \(menuBarTitle())"
-        button.toolTip = tracker?.currentDomain.map { "web-stats: \($0)" } ?? "web-stats"
-    }
-
-    private func menuBarTitle() -> String {
-        guard let tracker else { return "0s" }
-        if let currentDomain = tracker.currentDomain {
-            let seconds = tracker.sites.first { $0.domain == currentDomain }?.seconds ?? 0
-            return "\(Self.compactDomain(currentDomain)) \(DurationFormatter.string(from: seconds))"
+        if button.image != nil {
+            button.title = ""
         }
-
-        if let topSite = tracker.rankedSites.first {
-            return "\(Self.compactDomain(topSite.domain)) \(DurationFormatter.string(from: topSite.seconds))"
-        }
-
-        return "0s"
-    }
-
-    private static func compactDomain(_ domain: String) -> String {
-        guard domain.count > 22 else { return domain }
-        let end = domain.suffix(19)
-        return "...\(end)"
-    }
-}
-
-enum AppPaths {
-    static let appName = "web-stats"
-    static let oldAppName = "BraveSiteTracker"
-
-    static var dataDirectory: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport.appendingPathComponent(appName, isDirectory: true)
-    }
-
-    static var oldDataDirectory: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport.appendingPathComponent(oldAppName, isDirectory: true)
-    }
-
-    static var statsFile: URL {
-        dataDirectory.appendingPathComponent("site-totals.json")
-    }
-
-    static func prepareDataDirectory() {
-        try? FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
-        let oldStats = oldDataDirectory.appendingPathComponent("site-totals.json")
-        if !FileManager.default.fileExists(atPath: statsFile.path),
-           FileManager.default.fileExists(atPath: oldStats.path) {
-            try? FileManager.default.copyItem(at: oldStats, to: statsFile)
+        if let currentDomain = tracker?.currentDomain {
+            button.toolTip = "web-stats: \(currentDomain)"
+        } else if let error = tracker?.lastError {
+            button.toolTip = "web-stats: \(error)"
+        } else {
+            button.toolTip = "web-stats"
         }
     }
 }
@@ -145,21 +100,8 @@ struct SiteRecord: Identifiable, Codable, Equatable {
     var lastSeen: Date
 }
 
-struct TrackerSnapshot: Codable {
-    var sites: [SiteRecord]
-    var currentURL: String?
-    var currentDomain: String?
-    var lastError: String?
-    var lastUpdated: Date
-}
-
 @MainActor
 final class BraveTracker: ObservableObject {
-    enum Mode {
-        case tracking
-        case viewer
-    }
-
     @Published private(set) var sites: [SiteRecord] = []
     @Published private(set) var currentURL: String?
     @Published private(set) var currentDomain: String?
@@ -168,30 +110,26 @@ final class BraveTracker: ObservableObject {
 
     private let pollInterval: TimeInterval = 5
     private var timer: Timer?
+    private var activationObserver: NSObjectProtocol?
     private var lastTick = Date()
     private var previousDomain: String?
-    private let storeURL: URL
-    private let mode: Mode
 
-    init(mode: Mode = .tracking) {
-        self.mode = mode
-        AppPaths.prepareDataDirectory()
-        storeURL = AppPaths.statsFile
-        load()
-        if mode == .tracking {
-            start()
-        } else {
-            startViewerUpdates()
+    private static let braveBundleIdentifier = "com.brave.Browser"
+
+    init() {
+        start()
+    }
+
+    deinit {
+        if let activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
         }
     }
 
     func start() {
-        guard mode == .tracking else {
-            refreshNow()
-            return
-        }
         guard !isTracking else { return }
         isTracking = true
+        installActivationObserver()
         lastTick = Date()
         timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -202,16 +140,18 @@ final class BraveTracker: ObservableObject {
     }
 
     func stop() {
-        guard mode == .tracking else { return }
         guard isTracking else { return }
         tick()
         timer?.invalidate()
         timer = nil
+        if let activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+            self.activationObserver = nil
+        }
         isTracking = false
         previousDomain = nil
         currentDomain = nil
         currentURL = nil
-        save()
     }
 
     func reset() {
@@ -220,11 +160,10 @@ final class BraveTracker: ObservableObject {
         currentDomain = nil
         currentURL = nil
         lastError = nil
-        save()
     }
 
     func refreshNow() {
-        mode == .tracking ? tick() : load()
+        tick()
     }
 
     var rankedSites: [SiteRecord] {
@@ -240,16 +179,7 @@ final class BraveTracker: ObservableObject {
         sites.reduce(0) { $0 + $1.seconds }
     }
 
-    var dataDirectoryURL: URL {
-        storeURL.deletingLastPathComponent()
-    }
-
-    var statsFileURL: URL {
-        storeURL
-    }
-
     private func tick() {
-        guard mode == .tracking else { return }
         let now = Date()
         let elapsed = max(0, now.timeIntervalSince(lastTick))
         if let previousDomain, isBraveFrontmost() {
@@ -284,17 +214,6 @@ final class BraveTracker: ObservableObject {
             previousDomain = nil
             lastError = error.localizedDescription
         }
-
-        save()
-    }
-
-    private func startViewerUpdates() {
-        isTracking = true
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.load()
-            }
-        }
     }
 
     private func addTime(_ seconds: TimeInterval, to domain: String, at date: Date) {
@@ -319,36 +238,7 @@ final class BraveTracker: ObservableObject {
 
     private func isBraveFrontmost() -> Bool {
         let app = NSWorkspace.shared.frontmostApplication
-        return app?.bundleIdentifier == "com.brave.Browser"
-    }
-
-    private func load() {
-        guard let data = try? Data(contentsOf: storeURL) else { return }
-        do {
-            let snapshot = try JSONDecoder().decode(TrackerSnapshot.self, from: data)
-            sites = snapshot.sites
-            currentURL = snapshot.currentURL
-            currentDomain = snapshot.currentDomain
-            lastError = snapshot.lastError
-        } catch {
-            lastError = "Could not read saved totals: \(error.localizedDescription)"
-        }
-    }
-
-    private func save() {
-        let snapshot = TrackerSnapshot(
-            sites: sites,
-            currentURL: currentURL,
-            currentDomain: currentDomain,
-            lastError: lastError,
-            lastUpdated: Date()
-        )
-        do {
-            let data = try JSONEncoder.pretty.encode(snapshot)
-            try data.write(to: storeURL, options: .atomic)
-        } catch {
-            lastError = "Could not save totals: \(error.localizedDescription)"
-        }
+        return app?.bundleIdentifier == Self.braveBundleIdentifier
     }
 
     static func domain(from urlString: String) -> String? {
@@ -363,6 +253,41 @@ final class BraveTracker: ObservableObject {
             host.removeFirst(4)
         }
         return host.isEmpty ? nil : host
+    }
+
+    private func installActivationObserver() {
+        guard activationObserver == nil else { return }
+
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            Task { @MainActor in
+                let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                self?.handleActivatedApplication(app)
+            }
+        }
+    }
+
+    private func handleActivatedApplication(_ app: NSRunningApplication?) {
+        let now = Date()
+
+        if app?.bundleIdentifier == Self.braveBundleIdentifier {
+            lastTick = now
+            tick()
+            return
+        }
+
+        if let previousDomain {
+            addTime(max(0, now.timeIntervalSince(lastTick)), to: previousDomain, at: now)
+        }
+
+        lastTick = now
+        previousDomain = nil
+        currentDomain = nil
+        currentURL = nil
+        lastError = nil
     }
 }
 
@@ -465,96 +390,53 @@ final class MenuBarLoginItemController {
     }
 }
 
-@MainActor
-final class BackgroundAgentController: ObservableObject {
-    @Published private(set) var isEnabled: Bool
-    @Published private(set) var lastError: String?
+enum LegacyTrackerCleanup {
+    private static let labels = [
+        "dev.local.webstats.agent",
+        "dev.local.BraveSiteTracker.agent"
+    ]
 
-    private let label = "dev.local.webstats.agent"
-    private let plistURL: URL
+    static func removeObsoleteArtifacts() {
+        removeObsoleteAgents()
+        removeObsoleteHistoryFiles()
+    }
 
-    init() {
+    private static func removeObsoleteAgents() {
         let launchAgents = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
-        plistURL = launchAgents.appendingPathComponent("\(label).plist")
-        isEnabled = FileManager.default.fileExists(atPath: plistURL.path)
-        ensureInstalledAndRunning()
-    }
 
-    func setEnabled(_ enabled: Bool) {
-        enabled ? ensureInstalledAndRunning() : remove()
-    }
-
-    func refresh() {
-        isEnabled = FileManager.default.fileExists(atPath: plistURL.path)
-    }
-
-    func ensureInstalledAndRunning() {
-        do {
-            try install()
-            try launchctl(["bootstrap", "gui/\(getuid())", plistURL.path], allowFailure: true)
-            try launchctl(["enable", "gui/\(getuid())/\(label)"], allowFailure: true)
-            try launchctl(["kickstart", "-k", "gui/\(getuid())/\(label)"], allowFailure: true)
-            isEnabled = true
-            lastError = nil
-        } catch {
-            refresh()
-            lastError = "Background agent failed: \(error.localizedDescription)"
+        for label in labels {
+            runLaunchctl(["bootout", "gui/\(getuid())/\(label)"])
+            let plistURL = launchAgents.appendingPathComponent("\(label).plist")
+            try? FileManager.default.removeItem(at: plistURL)
         }
     }
 
-    private func remove() {
-        do {
-            try launchctl(["bootout", "gui/\(getuid())/\(label)"], allowFailure: true)
-            if FileManager.default.fileExists(atPath: plistURL.path) {
-                try FileManager.default.removeItem(at: plistURL)
-            }
-            isEnabled = false
-            lastError = nil
-        } catch {
-            refresh()
-            lastError = "Could not remove background agent: \(error.localizedDescription)"
+    private static func removeObsoleteHistoryFiles() {
+        let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first
+
+        guard let appSupport else { return }
+
+        for appName in ["web-stats", "BraveSiteTracker"] {
+            let fileURL = appSupport
+                .appendingPathComponent(appName, isDirectory: true)
+                .appendingPathComponent("site-totals.json")
+            try? FileManager.default.removeItem(at: fileURL)
         }
     }
 
-    private func install() throws {
-        try FileManager.default.createDirectory(
-            at: plistURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-
-        let bundleURL = CurrentAppBundle.url ?? Bundle.main.bundleURL
-        let executableURL = bundleURL
-            .appendingPathComponent("Contents/MacOS/web-stats-agent")
-        try LaunchAgentPlist.write([
-            "Label": label,
-            "ProgramArguments": [
-                executableURL.path
-            ],
-            "RunAtLoad": true,
-            "KeepAlive": true,
-            "ProcessType": "Background",
-            "StandardOutPath": "/tmp/web-stats.agent.log",
-            "StandardErrorPath": "/tmp/web-stats.agent.err"
-        ], to: plistURL)
-    }
-
-    private func launchctl(_ arguments: [String], allowFailure: Bool = false) throws {
+    private static func runLaunchctl(_ arguments: [String]) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
         process.arguments = arguments
-        let pipe = Pipe()
-        process.standardError = pipe
-        process.standardOutput = pipe
-        try process.run()
-        process.waitUntilExit()
-
-        guard process.terminationStatus == 0 || allowFailure else {
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let message = String(data: data, encoding: .utf8) ?? "launchctl failed"
-            throw NSError(domain: "web-stats", code: Int(process.terminationStatus), userInfo: [
-                NSLocalizedDescriptionKey: message.trimmingCharacters(in: .whitespacesAndNewlines)
-            ])
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return
         }
     }
 }
@@ -597,18 +479,8 @@ enum BraveAppleScript {
     }
 }
 
-extension JSONEncoder {
-    static var pretty: JSONEncoder {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
-        return encoder
-    }
-}
-
 struct MenuBarDashboard: View {
     @EnvironmentObject private var tracker: BraveTracker
-    @EnvironmentObject private var backgroundAgent: BackgroundAgentController
     @State private var showingResetAlert = false
 
     var body: some View {
@@ -631,10 +503,9 @@ struct MenuBarDashboard: View {
                 tracker.reset()
             }
         } message: {
-            Text("This deletes local totals stored by web-stats.")
+            Text("This clears totals for the current app session.")
         }
         .onAppear {
-            backgroundAgent.refresh()
             tracker.refreshNow()
         }
     }
@@ -642,7 +513,6 @@ struct MenuBarDashboard: View {
 
 struct MenuHeaderView: View {
     @EnvironmentObject private var tracker: BraveTracker
-    @EnvironmentObject private var backgroundAgent: BackgroundAgentController
     @Binding var showingResetAlert: Bool
 
     var body: some View {
@@ -665,14 +535,6 @@ struct MenuHeaderView: View {
             }
             .help("Refresh")
 
-            Button {
-                backgroundAgent.setEnabled(!backgroundAgent.isEnabled)
-            } label: {
-                Image(systemName: backgroundAgent.isEnabled ? "pause.fill" : "play.fill")
-            }
-            .buttonStyle(.borderedProminent)
-            .help(backgroundAgent.isEnabled ? "Stop background tracker" : "Start background tracker")
-
             Button(role: .destructive) {
                 showingResetAlert = true
             } label: {
@@ -690,13 +552,12 @@ struct MenuHeaderView: View {
         if let domain = tracker.currentDomain {
             return "Tracking \(domain)"
         }
-        return backgroundAgent.isEnabled ? "Background tracker running" : "Background tracker off"
+        return tracker.isTracking ? "Waiting for Brave" : "Tracking paused"
     }
 }
 
 struct MenuSummary: View {
     @EnvironmentObject private var tracker: BraveTracker
-    @EnvironmentObject private var backgroundAgent: BackgroundAgentController
 
     var body: some View {
         Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 14) {
@@ -706,7 +567,7 @@ struct MenuSummary: View {
             }
             GridRow {
                 StatBlock(title: "Top Site", value: tracker.rankedSites.first?.domain ?? "None")
-                StatBlock(title: "Status", value: backgroundAgent.isEnabled ? "Background" : "Off")
+                StatBlock(title: "Current Site", value: tracker.currentDomain ?? "None")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -782,41 +643,18 @@ struct StatBlock: View {
 
 struct MenuSettings: View {
     @EnvironmentObject private var tracker: BraveTracker
-    @EnvironmentObject private var backgroundAgent: BackgroundAgentController
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Divider()
 
-            Toggle("Background tracker", isOn: Binding(
-                get: { backgroundAgent.isEnabled },
-                set: { backgroundAgent.setEnabled($0) }
-            ))
-
-            Text("Keeps tracking after menubar app closes and starts again at login.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            if let error = backgroundAgent.lastError {
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-
             VStack(alignment: .leading, spacing: 6) {
-                Text("Local data")
+                Text("History")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                Text(tracker.statsFileURL.path)
+                Text("Not saved to disk")
                     .font(.caption)
-                    .lineLimit(2)
-                    .textSelection(.enabled)
-                Button {
-                    NSWorkspace.shared.activateFileViewerSelecting([tracker.statsFileURL])
-                } label: {
-                    Label("Show Data File", systemImage: "folder")
-                }
-                .buttonStyle(.bordered)
+                    .foregroundStyle(.secondary)
             }
 
             VStack(alignment: .leading, spacing: 6) {

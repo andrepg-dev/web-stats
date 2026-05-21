@@ -8,15 +8,11 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "web-stats", targets: ["WebStats"]),
-        .executable(name: "web-stats-agent", targets: ["WebStatsAgent"])
+        .executable(name: "web-stats", targets: ["WebStats"])
     ],
     targets: [
         .executableTarget(
             name: "WebStats"
-        ),
-        .executableTarget(
-            name: "WebStatsAgent"
         )
     ]
 )
