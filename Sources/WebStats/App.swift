@@ -1,6 +1,8 @@
 import AppKit
+import Charts
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -22,13 +24,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let content = MenuBarDashboard()
             .environmentObject(tracker)
-            .frame(width: 420, height: 560)
+            .frame(width: 460, height: 680)
 
         let hostingController = NSHostingController(rootView: content)
         let popover = NSPopover()
         popover.contentViewController = hostingController
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 420, height: 560)
+        popover.contentSize = NSSize(width: 460, height: 680)
         self.popover = popover
 
         let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -100,23 +102,121 @@ struct SiteRecord: Identifiable, Codable, Equatable {
     var lastSeen: Date
 }
 
+struct DailySiteRecord: Identifiable, Codable, Equatable {
+    var id: String { "\(day)|\(domain)" }
+    let day: String
+    let domain: String
+    var seconds: TimeInterval
+    var visits: Int
+    var lastSeen: Date
+}
+
+struct StatsSnapshot: Codable {
+    var schemaVersion: Int
+    var days: [DailySiteRecord]
+    var lastUpdated: Date
+}
+
+struct DailyTotal: Identifiable, Equatable {
+    var id: Date { day }
+    let day: Date
+    let seconds: TimeInterval
+}
+
+enum StatsRange: Int, CaseIterable, Identifiable {
+    case seven = 7
+    case thirty = 30
+    case sixty = 60
+
+    var id: Int { rawValue }
+    var days: Int { rawValue }
+    var title: String { "\(rawValue) days" }
+    var exportName: String { "\(rawValue)-days" }
+}
+
+enum StatsExportResult {
+    case saved(URL)
+    case cancelled
+    case failed(Error)
+}
+
+enum AppPaths {
+    static let appName = "web-stats"
+
+    static var dataDirectory: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport.appendingPathComponent(appName, isDirectory: true)
+    }
+
+    static var statsHistoryFile: URL {
+        dataDirectory.appendingPathComponent("stats-history.json")
+    }
+
+    static func prepareDataDirectory() throws {
+        try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
+    }
+}
+
+enum StatsDate {
+    static let calendar = Calendar.current
+
+    private static let dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
+    static func dayKey(for date: Date) -> String {
+        dayFormatter.string(from: date)
+    }
+
+    static func date(from dayKey: String) -> Date? {
+        dayFormatter.date(from: dayKey)
+    }
+
+    static func startDate(for range: StatsRange, endingAt date: Date = Date()) -> Date {
+        let today = calendar.startOfDay(for: date)
+        return calendar.date(byAdding: .day, value: -(range.days - 1), to: today) ?? today
+    }
+
+    static func days(in range: StatsRange, endingAt date: Date = Date()) -> [Date] {
+        let start = startDate(for: range, endingAt: date)
+        return (0..<range.days).compactMap {
+            calendar.date(byAdding: .day, value: $0, to: start)
+        }
+    }
+}
+
 @MainActor
 final class BraveTracker: ObservableObject {
     @Published private(set) var sites: [SiteRecord] = []
+    @Published private(set) var dailyRecords: [DailySiteRecord] = []
     @Published private(set) var currentURL: String?
     @Published private(set) var currentDomain: String?
     @Published private(set) var isTracking = false
     @Published private(set) var lastError: String?
 
     private let pollInterval: TimeInterval = 5
+    private let maxCountedInterval: TimeInterval = 120
+    private let storeURL = AppPaths.statsHistoryFile
     private var timer: Timer?
     private var activationObserver: NSObjectProtocol?
     private var lastTick = Date()
     private var previousDomain: String?
+    private var hasUnsavedChanges = false
 
     private static let braveBundleIdentifier = "com.brave.Browser"
 
     init() {
+        do {
+            try AppPaths.prepareDataDirectory()
+            load()
+        } catch {
+            lastError = "Could not prepare history storage: \(error.localizedDescription)"
+        }
         start()
     }
 
@@ -156,10 +256,13 @@ final class BraveTracker: ObservableObject {
 
     func reset() {
         sites.removeAll()
+        dailyRecords.removeAll()
         previousDomain = nil
         currentDomain = nil
         currentURL = nil
         lastError = nil
+        hasUnsavedChanges = true
+        saveIfNeeded()
     }
 
     func refreshNow() {
@@ -179,20 +282,64 @@ final class BraveTracker: ObservableObject {
         sites.reduce(0) { $0 + $1.seconds }
     }
 
+    var historyFileURL: URL {
+        storeURL
+    }
+
+    func dailyTotals(for range: StatsRange) -> [DailyTotal] {
+        let recordsByDay = Dictionary(grouping: records(for: range), by: \.day)
+        return StatsDate.days(in: range).map { day in
+            let key = StatsDate.dayKey(for: day)
+            let seconds = recordsByDay[key]?.reduce(0) { $0 + $1.seconds } ?? 0
+            return DailyTotal(day: day, seconds: seconds)
+        }
+    }
+
+    func rankedSites(for range: StatsRange) -> [SiteRecord] {
+        aggregateSites(from: records(for: range))
+    }
+
+    func totalSeconds(for range: StatsRange) -> TimeInterval {
+        records(for: range).reduce(0) { $0 + $1.seconds }
+    }
+
+    func exportStats(for range: StatsRange) -> StatsExportResult {
+        refreshNow()
+
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        panel.nameFieldStringValue = "web-stats-\(range.exportName).csv"
+
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return .cancelled
+        }
+
+        do {
+            try csvString(for: range).write(to: url, atomically: true, encoding: .utf8)
+            return .saved(url)
+        } catch {
+            lastError = "Could not export stats: \(error.localizedDescription)"
+            return .failed(error)
+        }
+    }
+
     private func tick() {
         let now = Date()
-        let elapsed = max(0, now.timeIntervalSince(lastTick))
-        if let previousDomain, isBraveFrontmost() {
-            addTime(elapsed, to: previousDomain, at: now)
+        let braveIsFrontmost = isBraveFrontmost()
+        if let previousDomain {
+            addElapsedTime(from: lastTick, to: now, for: previousDomain)
         }
 
         lastTick = now
 
-        guard isBraveFrontmost() else {
+        guard braveIsFrontmost else {
             previousDomain = nil
             currentDomain = nil
             currentURL = nil
             lastError = nil
+            saveIfNeeded()
             return
         }
 
@@ -214,6 +361,9 @@ final class BraveTracker: ObservableObject {
             previousDomain = nil
             lastError = error.localizedDescription
         }
+
+        pruneHistory()
+        saveIfNeeded()
     }
 
     private func addTime(_ seconds: TimeInterval, to domain: String, at date: Date) {
@@ -225,6 +375,8 @@ final class BraveTracker: ObservableObject {
         } else {
             sites.append(SiteRecord(domain: domain, seconds: seconds, visits: 0, lastSeen: date))
         }
+
+        upsertDailyRecord(day: StatsDate.dayKey(for: date), domain: domain, seconds: seconds, visits: 0, at: date)
     }
 
     private func countVisit(to domain: String, at date: Date) {
@@ -234,6 +386,8 @@ final class BraveTracker: ObservableObject {
         } else {
             sites.append(SiteRecord(domain: domain, seconds: 0, visits: 1, lastSeen: date))
         }
+
+        upsertDailyRecord(day: StatsDate.dayKey(for: date), domain: domain, seconds: 0, visits: 1, at: date)
     }
 
     private func isBraveFrontmost() -> Bool {
@@ -280,7 +434,7 @@ final class BraveTracker: ObservableObject {
         }
 
         if let previousDomain {
-            addTime(max(0, now.timeIntervalSince(lastTick)), to: previousDomain, at: now)
+            addElapsedTime(from: lastTick, to: now, for: previousDomain)
         }
 
         lastTick = now
@@ -288,6 +442,180 @@ final class BraveTracker: ObservableObject {
         currentDomain = nil
         currentURL = nil
         lastError = nil
+        saveIfNeeded()
+    }
+
+    private func addElapsedTime(from start: Date, to end: Date, for domain: String) {
+        let elapsed = end.timeIntervalSince(start)
+        guard elapsed > 0, elapsed <= maxCountedInterval else { return }
+
+        var segmentStart = start
+        while segmentStart < end {
+            let startOfDay = StatsDate.calendar.startOfDay(for: segmentStart)
+            guard let nextDay = StatsDate.calendar.date(byAdding: .day, value: 1, to: startOfDay) else {
+                addTime(end.timeIntervalSince(segmentStart), to: domain, at: segmentStart)
+                return
+            }
+
+            let segmentEnd = min(end, nextDay)
+            addTime(segmentEnd.timeIntervalSince(segmentStart), to: domain, at: segmentStart)
+            segmentStart = segmentEnd
+        }
+    }
+
+    private func upsertDailyRecord(day: String, domain: String, seconds: TimeInterval, visits: Int, at date: Date) {
+        if let index = dailyRecords.firstIndex(where: { $0.day == day && $0.domain == domain }) {
+            dailyRecords[index].seconds += seconds
+            dailyRecords[index].visits += visits
+            dailyRecords[index].lastSeen = max(dailyRecords[index].lastSeen, date)
+        } else {
+            dailyRecords.append(DailySiteRecord(
+                day: day,
+                domain: domain,
+                seconds: seconds,
+                visits: visits,
+                lastSeen: date
+            ))
+        }
+
+        hasUnsavedChanges = true
+    }
+
+    private func records(for range: StatsRange) -> [DailySiteRecord] {
+        let start = StatsDate.startDate(for: range)
+        return dailyRecords.filter { record in
+            guard let date = StatsDate.date(from: record.day) else { return false }
+            return date >= start
+        }
+    }
+
+    private func aggregateSites(from records: [DailySiteRecord]) -> [SiteRecord] {
+        Dictionary(grouping: records, by: \.domain).map { domain, records in
+            SiteRecord(
+                domain: domain,
+                seconds: records.reduce(0) { $0 + $1.seconds },
+                visits: records.reduce(0) { $0 + $1.visits },
+                lastSeen: records.map(\.lastSeen).max() ?? .distantPast
+            )
+        }
+        .sorted {
+            if $0.seconds == $1.seconds {
+                return $0.domain < $1.domain
+            }
+            return $0.seconds > $1.seconds
+        }
+    }
+
+    private func rebuildSitesFromHistory() {
+        sites = aggregateSites(from: dailyRecords)
+    }
+
+    private func pruneHistory() {
+        let start = StatsDate.startDate(for: .sixty)
+        let countBefore = dailyRecords.count
+        dailyRecords = dailyRecords.filter { record in
+            guard let date = StatsDate.date(from: record.day) else { return false }
+            return date >= start
+        }
+
+        if dailyRecords.count != countBefore {
+            rebuildSitesFromHistory()
+            hasUnsavedChanges = true
+        }
+    }
+
+    private func load() {
+        guard let data = try? Data(contentsOf: storeURL) else { return }
+
+        do {
+            let snapshot = try JSONDecoder.webStats.decode(StatsSnapshot.self, from: data)
+            dailyRecords = snapshot.days
+            hasUnsavedChanges = false
+            pruneHistory()
+            rebuildSitesFromHistory()
+            saveIfNeeded()
+        } catch {
+            lastError = "Could not read history: \(error.localizedDescription)"
+        }
+    }
+
+    private func saveIfNeeded() {
+        guard hasUnsavedChanges else { return }
+        save()
+    }
+
+    private func save() {
+        do {
+            let snapshot = StatsSnapshot(
+                schemaVersion: 1,
+                days: dailyRecords.sorted {
+                    if $0.day == $1.day {
+                        return $0.domain < $1.domain
+                    }
+                    return $0.day < $1.day
+                },
+                lastUpdated: Date()
+            )
+            let data = try JSONEncoder.webStats.encode(snapshot)
+            try data.write(to: storeURL, options: .atomic)
+            hasUnsavedChanges = false
+        } catch {
+            lastError = "Could not save history: \(error.localizedDescription)"
+        }
+    }
+
+    private func csvString(for range: StatsRange) -> String {
+        let formatter = ISO8601DateFormatter()
+        var rows = [
+            ["date", "domain", "time_seconds", "time_minutes", "time_hours", "visits", "last_seen"]
+        ]
+
+        for record in records(for: range).sorted(by: { lhs, rhs in
+            if lhs.day == rhs.day {
+                return lhs.domain < rhs.domain
+            }
+            return lhs.day < rhs.day
+        }) {
+            rows.append([
+                record.day,
+                record.domain,
+                String(Int(record.seconds.rounded())),
+                String(format: "%.2f", record.seconds / 60),
+                String(format: "%.2f", record.seconds / 3600),
+                String(record.visits),
+                formatter.string(from: record.lastSeen)
+            ])
+        }
+
+        return rows.map(Self.csvLine).joined(separator: "\n") + "\n"
+    }
+
+    private static func csvLine(_ fields: [String]) -> String {
+        fields.map { field in
+            let escaped = field.replacingOccurrences(of: "\"", with: "\"\"")
+            if escaped.contains(",") || escaped.contains("\"") || escaped.contains("\n") {
+                return "\"\(escaped)\""
+            }
+            return escaped
+        }
+        .joined(separator: ",")
+    }
+}
+
+extension JSONDecoder {
+    static var webStats: JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+}
+
+extension JSONEncoder {
+    static var webStats: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
     }
 }
 
@@ -490,7 +818,7 @@ struct MenuBarDashboard: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     MenuSummary()
-                    MenuTopSites()
+                    MenuStatsTabs()
                     MenuSettings()
                 }
                 .padding(18)
@@ -503,7 +831,7 @@ struct MenuBarDashboard: View {
                 tracker.reset()
             }
         } message: {
-            Text("This clears totals for the current app session.")
+            Text("This deletes saved web-stats history.")
         }
         .onAppear {
             tracker.refreshNow()
@@ -571,6 +899,112 @@ struct MenuSummary: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct MenuStatsTabs: View {
+    var body: some View {
+        TabView {
+            ForEach(StatsRange.allCases) { range in
+                MenuRangeStats(range: range)
+                    .tabItem {
+                        Text(range.title)
+                    }
+            }
+        }
+        .frame(height: 410)
+    }
+}
+
+struct MenuRangeStats: View {
+    @EnvironmentObject private var tracker: BraveTracker
+    let range: StatsRange
+    @State private var exportMessage: String?
+
+    private var rangeSites: [SiteRecord] {
+        tracker.rankedSites(for: range)
+    }
+
+    private var axisStride: Int {
+        switch range {
+        case .seven:
+            return 1
+        case .thirty:
+            return 5
+        case .sixty:
+            return 10
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                StatBlock(title: "Total", value: DurationFormatter.string(from: tracker.totalSeconds(for: range)))
+                StatBlock(title: "Daily Avg", value: DurationFormatter.string(from: tracker.totalSeconds(for: range) / Double(range.days)))
+                Spacer(minLength: 12)
+                Button {
+                    exportStats()
+                } label: {
+                    Label("Export Stats", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+
+            Chart(tracker.dailyTotals(for: range)) { total in
+                BarMark(
+                    x: .value("Day", total.day, unit: .day),
+                    y: .value("Minutes", total.seconds / 60)
+                )
+                .foregroundStyle(Color.accentColor.gradient)
+            }
+            .chartXAxis {
+                AxisMarks(values: .stride(by: .day, count: axisStride)) {
+                    AxisGridLine()
+                    AxisTick()
+                    AxisValueLabel(format: .dateTime.month(.abbreviated).day())
+                }
+            }
+            .chartYAxisLabel("Minutes")
+            .frame(height: 150)
+
+            if let exportMessage {
+                Text(exportMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Top Websites")
+                    .font(.subheadline.weight(.semibold))
+
+                if rangeSites.isEmpty {
+                    Text("No data for this range")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 8)
+                } else {
+                    VStack(spacing: 8) {
+                        ForEach(Array(rangeSites.prefix(4).enumerated()), id: \.element.domain) { index, site in
+                            SiteRow(rank: index + 1, site: site, maxSeconds: max(1, rangeSites.first?.seconds ?? 1))
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.top, 8)
+    }
+
+    private func exportStats() {
+        switch tracker.exportStats(for: range) {
+        case .saved(let url):
+            exportMessage = "Exported \(url.lastPathComponent)"
+        case .cancelled:
+            break
+        case .failed(let error):
+            exportMessage = error.localizedDescription
+        }
     }
 }
 
@@ -652,9 +1086,11 @@ struct MenuSettings: View {
                 Text("History")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                Text("Not saved to disk")
+                Text(tracker.historyFileURL.path)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
             }
 
             VStack(alignment: .leading, spacing: 6) {
