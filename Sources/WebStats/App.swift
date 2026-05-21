@@ -2,13 +2,13 @@ import AppKit
 import Foundation
 import SwiftUI
 
-@main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
     private var tracker: BraveTracker?
     private var backgroundAgent: BackgroundAgentController?
+    private var menuBarLoginItem: MenuBarLoginItemController?
     private var titleTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -16,8 +16,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let tracker = BraveTracker(mode: .viewer)
         let backgroundAgent = BackgroundAgentController()
+        let menuBarLoginItem = MenuBarLoginItemController()
         self.tracker = tracker
         self.backgroundAgent = backgroundAgent
+        self.menuBarLoginItem = menuBarLoginItem
+        menuBarLoginItem.ensureInstalled()
 
         let content = MenuBarDashboard()
             .environmentObject(tracker)
@@ -31,13 +34,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentSize = NSSize(width: 420, height: 560)
         self.popover = popover
 
-        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.isVisible = true
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
-        statusItem.button?.image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "web-stats")
+        let icon = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "web-stats")
+        icon?.isTemplate = true
+        statusItem.button?.image = icon
+        statusItem.button?.imageScaling = .scaleProportionallyDown
         statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.toolTip = "web-stats"
+        if icon == nil {
+            statusItem.length = NSStatusItem.variableLength
+            statusItem.button?.title = "WS"
+        }
         self.statusItem = statusItem
 
         updateStatusTitle()
@@ -75,7 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusTitle() {
         guard let button = statusItem?.button else { return }
-        button.title = ""
+        button.title = button.image == nil ? "WS" : ""
         button.toolTip = tracker?.currentDomain.map { "web-stats: \($0)" } ?? "web-stats"
     }
 }
@@ -118,7 +128,9 @@ struct SiteRecord: Identifiable, Codable, Equatable {
 
 struct TrackerSnapshot: Codable {
     var sites: [SiteRecord]
+    var currentURL: String?
     var currentDomain: String?
+    var lastError: String?
     var lastUpdated: Date
 }
 
@@ -231,6 +243,7 @@ final class BraveTracker: ObservableObject {
             previousDomain = nil
             currentDomain = nil
             currentURL = nil
+            lastError = nil
             return
         }
 
@@ -295,14 +308,22 @@ final class BraveTracker: ObservableObject {
         do {
             let snapshot = try JSONDecoder().decode(TrackerSnapshot.self, from: data)
             sites = snapshot.sites
+            currentURL = snapshot.currentURL
             currentDomain = snapshot.currentDomain
+            lastError = snapshot.lastError
         } catch {
             lastError = "Could not read saved totals: \(error.localizedDescription)"
         }
     }
 
     private func save() {
-        let snapshot = TrackerSnapshot(sites: sites, currentDomain: currentDomain, lastUpdated: Date())
+        let snapshot = TrackerSnapshot(
+            sites: sites,
+            currentURL: currentURL,
+            currentDomain: currentDomain,
+            lastError: lastError,
+            lastUpdated: Date()
+        )
         do {
             let data = try JSONEncoder.pretty.encode(snapshot)
             try data.write(to: storeURL, options: .atomic)
@@ -312,7 +333,10 @@ final class BraveTracker: ObservableObject {
     }
 
     static func domain(from urlString: String) -> String? {
-        guard let url = URL(string: urlString), var host = url.host(percentEncoded: false) else {
+        guard let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              var host = url.host(percentEncoded: false) else {
             return nil
         }
         host = host.lowercased()
@@ -320,6 +344,105 @@ final class BraveTracker: ObservableObject {
             host.removeFirst(4)
         }
         return host.isEmpty ? nil : host
+    }
+}
+
+enum LaunchAgentPlist {
+    static func write(_ propertyList: [String: Any], to url: URL) throws {
+        let data = try PropertyListSerialization.data(
+            fromPropertyList: propertyList,
+            format: .xml,
+            options: 0
+        )
+        try data.write(to: url, options: .atomic)
+    }
+}
+
+enum CurrentAppBundle {
+    static var url: URL? {
+        let candidates = [
+            Bundle.main.bundleURL,
+            Bundle.main.executableURL
+        ].compactMap { $0 }
+
+        for candidate in candidates {
+            if let appURL = enclosingAppBundle(from: candidate) {
+                return appURL
+            }
+        }
+
+        return nil
+    }
+
+    private static func enclosingAppBundle(from url: URL) -> URL? {
+        var candidate = url.standardizedFileURL
+        if !candidate.hasDirectoryPath {
+            candidate.deleteLastPathComponent()
+        }
+
+        while candidate.path != "/" {
+            if candidate.pathExtension == "app",
+               FileManager.default.fileExists(
+                   atPath: candidate
+                       .appendingPathComponent("Contents/Info.plist")
+                       .path
+               ) {
+                return candidate
+            }
+            candidate.deleteLastPathComponent()
+        }
+
+        return nil
+    }
+}
+
+@MainActor
+final class MenuBarLoginItemController {
+    private let label = "dev.local.webstats.menubar"
+    private let plistURL: URL
+
+    init() {
+        let launchAgents = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+        plistURL = launchAgents.appendingPathComponent("\(label).plist")
+    }
+
+    func ensureInstalled() {
+        do {
+            try install()
+        } catch {
+            try? "Menu bar login item failed: \(error.localizedDescription)\n"
+                .write(
+                    to: URL(fileURLWithPath: "/tmp/web-stats.menubar.err"),
+                    atomically: true,
+                    encoding: .utf8
+                )
+            // The menu bar app still works when opened manually; this only affects login startup.
+        }
+    }
+
+    private func install() throws {
+        guard let appURL = CurrentAppBundle.url else {
+            throw NSError(domain: "web-stats", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Could not resolve web-stats.app from \(Bundle.main.bundleURL.path)."
+            ])
+        }
+
+        try FileManager.default.createDirectory(
+            at: plistURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        try LaunchAgentPlist.write([
+            "Label": label,
+            "ProgramArguments": [
+                "/usr/bin/open",
+                "-gj",
+                appURL.path
+            ],
+            "RunAtLoad": true,
+            "ProcessType": "Interactive"
+        ], to: plistURL)
     }
 }
 
@@ -381,34 +504,20 @@ final class BackgroundAgentController: ObservableObject {
             withIntermediateDirectories: true
         )
 
-        let executableURL = Bundle.main.bundleURL
+        let bundleURL = CurrentAppBundle.url ?? Bundle.main.bundleURL
+        let executableURL = bundleURL
             .appendingPathComponent("Contents/MacOS/web-stats-agent")
-        let plist = """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>Label</key>
-            <string>\(label)</string>
-            <key>ProgramArguments</key>
-            <array>
-                <string>\(executableURL.path)</string>
-            </array>
-            <key>RunAtLoad</key>
-            <true/>
-            <key>KeepAlive</key>
-            <true/>
-            <key>ProcessType</key>
-            <string>Background</string>
-            <key>StandardOutPath</key>
-            <string>/tmp/web-stats.agent.log</string>
-            <key>StandardErrorPath</key>
-            <string>/tmp/web-stats.agent.err</string>
-        </dict>
-        </plist>
-        """
-
-        try plist.write(to: plistURL, atomically: true, encoding: .utf8)
+        try LaunchAgentPlist.write([
+            "Label": label,
+            "ProgramArguments": [
+                executableURL.path
+            ],
+            "RunAtLoad": true,
+            "KeepAlive": true,
+            "ProcessType": "Background",
+            "StandardOutPath": "/tmp/web-stats.agent.log",
+            "StandardErrorPath": "/tmp/web-stats.agent.err"
+        ], to: plistURL)
     }
 
     private func launchctl(_ arguments: [String], allowFailure: Bool = false) throws {
@@ -704,7 +813,7 @@ struct MenuSettings: View {
             Button {
                 NSApp.terminate(nil)
             } label: {
-                Label("Quit", systemImage: "power")
+                Label("Quit Menu Bar", systemImage: "power")
             }
             .buttonStyle(.bordered)
         }

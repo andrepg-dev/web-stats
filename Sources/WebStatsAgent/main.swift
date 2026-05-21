@@ -11,7 +11,9 @@ struct SiteRecord: Identifiable, Codable, Equatable {
 
 struct TrackerSnapshot: Codable {
     var sites: [SiteRecord]
+    var currentURL: String?
     var currentDomain: String?
+    var lastError: String?
     var lastUpdated: Date
 }
 
@@ -81,6 +83,7 @@ final class HeadlessBraveTracker {
             previousDomain = nil
             currentDomain = nil
             currentURL = nil
+            lastError = nil
             save()
             return
         }
@@ -136,14 +139,22 @@ final class HeadlessBraveTracker {
         do {
             let snapshot = try JSONDecoder().decode(TrackerSnapshot.self, from: data)
             sites = snapshot.sites
+            currentURL = snapshot.currentURL
             currentDomain = snapshot.currentDomain
+            lastError = snapshot.lastError
         } catch {
             lastError = "Could not read saved totals: \(error.localizedDescription)"
         }
     }
 
     private func save() {
-        let snapshot = TrackerSnapshot(sites: sites, currentDomain: currentDomain, lastUpdated: Date())
+        let snapshot = TrackerSnapshot(
+            sites: sites,
+            currentURL: currentURL,
+            currentDomain: currentDomain,
+            lastError: lastError,
+            lastUpdated: Date()
+        )
         do {
             let data = try JSONEncoder.pretty.encode(snapshot)
             try data.write(to: storeURL, options: .atomic)
@@ -153,7 +164,10 @@ final class HeadlessBraveTracker {
     }
 
     static func domain(from urlString: String) -> String? {
-        guard let url = URL(string: urlString), var host = url.host(percentEncoded: false) else {
+        guard let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              var host = url.host(percentEncoded: false) else {
             return nil
         }
         host = host.lowercased()

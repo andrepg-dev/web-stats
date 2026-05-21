@@ -23,11 +23,18 @@ This runs from Terminal, so packaging is better for normal use.
 open .build/web-stats.app
 ```
 
-The packaged app installs a `launchd` background helper and shows stats from a native AppKit menu bar item. Tracking continues if the menu bar app is closed because the helper writes stats to the local JSON file.
+The packaged app installs two user `launchd` jobs:
 
-For the most reliable login behavior, move `.build/web-stats.app` to `~/Applications`, then open it once. The menu bar app installs the background helper automatically.
+- `dev.local.webstats.menubar` starts the menu bar UI at login, without `KeepAlive`.
+- `dev.local.webstats.agent` runs the tracker helper with `KeepAlive`.
+
+Tracking continues if the menu bar app is closed because the helper writes stats to the local JSON file. If macOS Settings disables the background helper, macOS can stop tracking until permission is restored.
+
+For the most reliable login behavior, move `.build/web-stats.app` to `~/Applications`, then open it once. The menu bar app installs both jobs automatically.
 
 macOS may ask for Automation permission so the app can read Brave's active tab URL. Grant it for tracking to work.
+
+Only `http` and `https` tabs are counted. Brave internal pages such as new tabs and settings are ignored.
 
 ## Notes
 

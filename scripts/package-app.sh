@@ -34,6 +34,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSAppleEventsUsageDescription</key>
     <string>web-stats reads Brave's active tab URL to track time spent by website.</string>
 </dict>
