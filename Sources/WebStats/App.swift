@@ -34,7 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentSize = NSSize(width: 420, height: 560)
         self.popover = popover
 
-        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.isVisible = true
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
@@ -42,10 +42,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         icon?.isTemplate = true
         statusItem.button?.image = icon
         statusItem.button?.imageScaling = .scaleProportionallyDown
-        statusItem.button?.imagePosition = .imageOnly
+        statusItem.button?.imagePosition = .imageLeft
         statusItem.button?.toolTip = "web-stats"
         if icon == nil {
-            statusItem.length = NSStatusItem.variableLength
             statusItem.button?.title = "WS"
         }
         self.statusItem = statusItem
@@ -85,8 +84,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusTitle() {
         guard let button = statusItem?.button else { return }
-        button.title = button.image == nil ? "WS" : ""
+        button.title = " \(menuBarTitle())"
         button.toolTip = tracker?.currentDomain.map { "web-stats: \($0)" } ?? "web-stats"
+    }
+
+    private func menuBarTitle() -> String {
+        guard let tracker else { return "0s" }
+        if let currentDomain = tracker.currentDomain {
+            let seconds = tracker.sites.first { $0.domain == currentDomain }?.seconds ?? 0
+            return "\(Self.compactDomain(currentDomain)) \(DurationFormatter.string(from: seconds))"
+        }
+
+        if let topSite = tracker.rankedSites.first {
+            return "\(Self.compactDomain(topSite.domain)) \(DurationFormatter.string(from: topSite.seconds))"
+        }
+
+        return "0s"
+    }
+
+    private static func compactDomain(_ domain: String) -> String {
+        guard domain.count > 22 else { return domain }
+        let end = domain.suffix(19)
+        return "...\(end)"
     }
 }
 
