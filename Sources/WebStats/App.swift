@@ -123,6 +123,13 @@ struct DailyTotal: Identifiable, Equatable {
     let seconds: TimeInterval
 }
 
+struct DailyDomainTotal: Identifiable, Equatable {
+    var id: String { "\(day)|\(domain)" }
+    let day: Date
+    let domain: String
+    let seconds: TimeInterval
+}
+
 enum StatsRange: Int, CaseIterable, Identifiable {
     case seven = 7
     case thirty = 30
@@ -295,8 +302,26 @@ final class BraveTracker: ObservableObject {
         }
     }
 
+    func dailyDomainTotals(for range: StatsRange) -> [DailyDomainTotal] {
+        records(for: range)
+            .compactMap { record in
+                guard let day = StatsDate.date(from: record.day) else { return nil }
+                return DailyDomainTotal(day: day, domain: record.domain, seconds: record.seconds)
+            }
+            .sorted {
+                if $0.day == $1.day {
+                    return $0.domain < $1.domain
+                }
+                return $0.day < $1.day
+            }
+    }
+
     func rankedSites(for range: StatsRange) -> [SiteRecord] {
         aggregateSites(from: records(for: range))
+    }
+
+    func chartDomains(for range: StatsRange) -> [String] {
+        rankedSites(for: range).map(\.domain)
     }
 
     func totalSeconds(for range: StatsRange) -> TimeInterval {
@@ -810,18 +835,19 @@ enum BraveAppleScript {
 struct MenuBarDashboard: View {
     @EnvironmentObject private var tracker: BraveTracker
     @State private var showingResetAlert = false
+    @State private var selectedRange: StatsRange = .seven
 
     var body: some View {
         VStack(spacing: 0) {
             MenuHeaderView(showingResetAlert: $showingResetAlert)
             Divider()
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    MenuSummary()
-                    MenuStatsTabs()
-                    MenuSettings()
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    MenuSummaryCard()
+                    MenuStatsSection(selectedRange: $selectedRange)
+                    MenuSettingsCard()
                 }
-                .padding(18)
+                .padding(16)
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -888,12 +914,19 @@ struct MenuSummary: View {
     @EnvironmentObject private var tracker: BraveTracker
 
     var body: some View {
-        Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 14) {
-            GridRow {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Overview")
+                .font(.subheadline.weight(.semibold))
+
+            LazyVGrid(
+                columns: [
+                    GridItem(.flexible(), spacing: 12),
+                    GridItem(.flexible(), spacing: 12)
+                ],
+                spacing: 12
+            ) {
                 StatBlock(title: "Tracked Sites", value: "\(tracker.sites.count)")
                 StatBlock(title: "Total Time", value: DurationFormatter.string(from: tracker.totalSeconds))
-            }
-            GridRow {
                 StatBlock(title: "Top Site", value: tracker.rankedSites.first?.domain ?? "None")
                 StatBlock(title: "Current Site", value: tracker.currentDomain ?? "None")
             }
@@ -902,31 +935,25 @@ struct MenuSummary: View {
     }
 }
 
-struct MenuStatsTabs: View {
+struct MenuSummaryCard: View {
     var body: some View {
-        TabView {
-            ForEach(StatsRange.allCases) { range in
-                MenuRangeStats(range: range)
-                    .tabItem {
-                        Text(range.title)
-                    }
-            }
+        DashboardCard {
+            MenuSummary()
         }
-        .frame(height: 410)
     }
 }
 
-struct MenuRangeStats: View {
+struct MenuStatsSection: View {
     @EnvironmentObject private var tracker: BraveTracker
-    let range: StatsRange
+    @Binding var selectedRange: StatsRange
     @State private var exportMessage: String?
 
     private var rangeSites: [SiteRecord] {
-        tracker.rankedSites(for: range)
+        tracker.rankedSites(for: selectedRange)
     }
 
     private var axisStride: Int {
-        switch range {
+        switch selectedRange {
         case .seven:
             return 1
         case .thirty:
@@ -937,67 +964,118 @@ struct MenuRangeStats: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                StatBlock(title: "Total", value: DurationFormatter.string(from: tracker.totalSeconds(for: range)))
-                StatBlock(title: "Daily Avg", value: DurationFormatter.string(from: tracker.totalSeconds(for: range) / Double(range.days)))
-                Spacer(minLength: 12)
-                Button {
-                    exportStats()
-                } label: {
-                    Label("Export Stats", systemImage: "square.and.arrow.up")
-                }
-                .buttonStyle(.borderedProminent)
-            }
+        DashboardCard {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("History")
+                            .font(.subheadline.weight(.semibold))
+                        Text("7, 30, 60 day view")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
 
-            Chart(tracker.dailyTotals(for: range)) { total in
-                BarMark(
-                    x: .value("Day", total.day, unit: .day),
-                    y: .value("Minutes", total.seconds / 60)
+                    Spacer()
+
+                    Button {
+                        exportStats()
+                    } label: {
+                        Label("Export", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+
+                Picker("Range", selection: $selectedRange) {
+                    Text("7 days").tag(StatsRange.seven)
+                    Text("30 days").tag(StatsRange.thirty)
+                    Text("60 days").tag(StatsRange.sixty)
+                }
+                .pickerStyle(.segmented)
+
+                HStack(spacing: 12) {
+                    StatBlock(title: "Total", value: DurationFormatter.string(from: tracker.totalSeconds(for: selectedRange)))
+                    StatBlock(title: "Daily Avg", value: DurationFormatter.string(from: tracker.totalSeconds(for: selectedRange) / Double(selectedRange.days)))
+                }
+
+                let chartDomains = tracker.chartDomains(for: selectedRange)
+                Chart(tracker.dailyDomainTotals(for: selectedRange)) { point in
+                    BarMark(
+                        x: .value("Day", point.day, unit: .day),
+                        y: .value("Minutes", point.seconds / 60)
+                    )
+                    .foregroundStyle(by: .value("Website", point.domain))
+                }
+                .chartForegroundStyleScale(
+                    domain: chartDomains,
+                    range: chartDomains.map(DomainPalette.color(for:))
                 )
-                .foregroundStyle(Color.accentColor.gradient)
-            }
-            .chartXAxis {
-                AxisMarks(values: .stride(by: .day, count: axisStride)) {
-                    AxisGridLine()
-                    AxisTick()
-                    AxisValueLabel(format: .dateTime.month(.abbreviated).day())
+                .chartXAxis {
+                    AxisMarks(values: .stride(by: .day, count: axisStride)) {
+                        AxisGridLine()
+                        AxisTick()
+                        AxisValueLabel(format: .dateTime.month(.abbreviated).day())
+                    }
                 }
-            }
-            .chartYAxisLabel("Minutes")
-            .frame(height: 150)
+                .chartYAxisLabel("Minutes")
+                .frame(height: 190)
 
-            if let exportMessage {
-                Text(exportMessage)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
+                if !chartDomains.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(chartDomains.prefix(6), id: \.self) { domain in
+                                HStack(spacing: 6) {
+                                    Circle()
+                                        .fill(DomainPalette.color(for: domain))
+                                        .frame(width: 8, height: 8)
+                                    Text(domain)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                .padding(.vertical, 4)
+                                .padding(.horizontal, 8)
+                                .background(Color(nsColor: .windowBackgroundColor), in: Capsule())
+                            }
+                        }
+                    }
+                }
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Top Websites")
-                    .font(.subheadline.weight(.semibold))
-
-                if rangeSites.isEmpty {
-                    Text("No data for this range")
+                if let exportMessage {
+                    Text(exportMessage)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 8)
-                } else {
-                    VStack(spacing: 8) {
-                        ForEach(Array(rangeSites.prefix(4).enumerated()), id: \.element.domain) { index, site in
-                            SiteRow(rank: index + 1, site: site, maxSeconds: max(1, rangeSites.first?.seconds ?? 1))
+                        .lineLimit(2)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Top Websites")
+                        .font(.subheadline.weight(.semibold))
+
+                    if rangeSites.isEmpty {
+                        Text("No data for this range")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 8)
+                    } else {
+                        VStack(spacing: 8) {
+                            ForEach(Array(rangeSites.prefix(4).enumerated()), id: \.element.domain) { index, site in
+                                SiteRow(
+                                    rank: index + 1,
+                                    site: site,
+                                    maxSeconds: max(1, rangeSites.first?.seconds ?? 1),
+                                    swatch: DomainPalette.color(for: site.domain)
+                                )
+                            }
                         }
                     }
                 }
             }
         }
-        .padding(.top, 8)
     }
 
     private func exportStats() {
-        switch tracker.exportStats(for: range) {
+        switch tracker.exportStats(for: selectedRange) {
         case .saved(let url):
             exportMessage = "Exported \(url.lastPathComponent)"
         case .cancelled:
@@ -1008,36 +1086,18 @@ struct MenuRangeStats: View {
     }
 }
 
-struct MenuTopSites: View {
-    @EnvironmentObject private var tracker: BraveTracker
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Top Websites")
-                .font(.subheadline.weight(.semibold))
-
-            if tracker.rankedSites.isEmpty {
-                EmptyStateView()
-                    .frame(maxWidth: .infinity)
-            } else {
-                VStack(spacing: 8) {
-                    ForEach(Array(tracker.rankedSites.prefix(8).enumerated()), id: \.element.domain) { index, site in
-                        SiteRow(rank: index + 1, site: site, maxSeconds: max(1, tracker.rankedSites.first?.seconds ?? 1))
-                    }
-                }
-            }
-        }
-    }
-}
-
 struct SiteRow: View {
     let rank: Int
     let site: SiteRecord
     let maxSeconds: TimeInterval
+    let swatch: Color
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
+                Circle()
+                    .fill(swatch)
+                    .frame(width: 8, height: 8)
                 Text("\(rank)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
@@ -1053,8 +1113,6 @@ struct SiteRow: View {
             ProgressView(value: site.seconds / maxSeconds)
                 .progressViewStyle(.linear)
         }
-        .padding(10)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
@@ -1075,40 +1133,43 @@ struct StatBlock: View {
     }
 }
 
-struct MenuSettings: View {
+struct MenuSettingsCard: View {
     @EnvironmentObject private var tracker: BraveTracker
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Divider()
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("History")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Text(tracker.historyFileURL.path)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .textSelection(.enabled)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
+        DashboardCard {
+            VStack(alignment: .leading, spacing: 12) {
                 Text("Current URL")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .font(.subheadline.weight(.semibold))
+
                 Text(tracker.currentURL ?? "No active Brave tab")
                     .font(.caption)
+                    .foregroundStyle(.secondary)
                     .lineLimit(3)
                     .textSelection(.enabled)
-            }
 
-            Button {
-                NSApp.terminate(nil)
-            } label: {
-                Label("Quit Menu Bar", systemImage: "power")
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("History file")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Text(tracker.historyFileURL.path)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        NSApp.terminate(nil)
+                    } label: {
+                        Label("Quit", systemImage: "power")
+                    }
+                    .buttonStyle(.bordered)
+                }
             }
-            .buttonStyle(.bordered)
         }
     }
 }
@@ -1128,6 +1189,36 @@ struct EmptyStateView: View {
                 .frame(maxWidth: 360)
         }
         .padding(24)
+    }
+}
+
+struct DashboardCard<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        content
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(14)
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+enum DomainPalette {
+    static func color(for domain: String) -> Color {
+        let hash = stableHash(domain)
+        let hue = Double(hash % 360) / 360.0
+        let saturation = 0.58 + Double((hash >> 8) % 20) / 100.0
+        let brightness = 0.72 + Double((hash >> 16) % 14) / 100.0
+        return Color(hue: hue, saturation: min(saturation, 0.85), brightness: min(brightness, 0.92))
+    }
+
+    private static func stableHash(_ value: String) -> UInt64 {
+        var hash: UInt64 = 1469598103934665603
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1099511628211
+        }
+        return hash
     }
 }
 
