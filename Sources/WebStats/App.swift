@@ -1,5 +1,4 @@
 import AppKit
-import Charts
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -314,6 +313,11 @@ final class BraveTracker: ObservableObject {
                 }
                 return $0.day < $1.day
             }
+    }
+
+    func chartDailyDomainTotals(for range: StatsRange) -> [DailyDomainTotal] {
+        let domains = Set(chartDomains(for: range))
+        return dailyDomainTotals(for: range).filter { domains.contains($0.domain) }
     }
 
     func rankedSites(for range: StatsRange) -> [SiteRecord] {
@@ -1020,25 +1024,12 @@ struct MenuStatsSection: View {
                 }
 
                 let chartDomains = tracker.chartDomains(for: selectedRange)
-                Chart(tracker.dailyDomainTotals(for: selectedRange)) { point in
-                    BarMark(
-                        x: .value("Day", point.day, unit: .day),
-                        y: .value("Minutes", point.seconds / 60)
-                    )
-                    .foregroundStyle(by: .value("Website", point.domain))
-                }
-                .chartForegroundStyleScale(
-                    domain: chartDomains,
-                    range: chartDomains.map(DomainPalette.color(for:))
+                DomainBarChart(
+                    range: selectedRange,
+                    points: tracker.chartDailyDomainTotals(for: selectedRange),
+                    domains: chartDomains,
+                    axisStride: axisStride
                 )
-                .chartXAxis {
-                    AxisMarks(values: .stride(by: .day, count: axisStride)) {
-                        AxisGridLine()
-                        AxisTick()
-                        AxisValueLabel(format: .dateTime.month(.abbreviated).day())
-                    }
-                }
-                .chartYAxisLabel("Minutes")
                 .frame(height: 190)
 
                 if !chartDomains.isEmpty {
@@ -1182,6 +1173,92 @@ struct SiteRow: View {
             ProgressView(value: site.seconds / maxSeconds)
                 .progressViewStyle(.linear)
         }
+    }
+}
+
+struct DomainBarChart: View {
+    let range: StatsRange
+    let points: [DailyDomainTotal]
+    let domains: [String]
+    let axisStride: Int
+
+    private var days: [Date] {
+        StatsDate.days(in: range)
+    }
+
+    private var totalsByDayAndDomain: [String: TimeInterval] {
+        points.reduce(into: [:]) { result, point in
+            let key = "\(StatsDate.dayKey(for: point.day))|\(point.domain)"
+            result[key, default: 0] += point.seconds
+        }
+    }
+
+    private var maxDailySeconds: TimeInterval {
+        max(
+            1,
+            days.map { day in
+                domains.reduce(0) { total, domain in
+                    total + seconds(for: day, domain: domain)
+                }
+            }.max() ?? 1
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            GeometryReader { proxy in
+                let plotHeight = max(92, proxy.size.height - 28)
+
+                VStack(spacing: 6) {
+                    HStack(alignment: .bottom, spacing: 2) {
+                        ForEach(days, id: \.self) { day in
+                            VStack(spacing: 0) {
+                                Spacer(minLength: 0)
+                                VStack(spacing: 0) {
+                                    ForEach(domains.reversed(), id: \.self) { domain in
+                                        let seconds = seconds(for: day, domain: domain)
+                                        if seconds > 0 {
+                                            Rectangle()
+                                                .fill(DomainPalette.color(for: domain))
+                                                .frame(height: max(1, plotHeight * seconds / maxDailySeconds))
+                                        }
+                                    }
+                                }
+                                .clipShape(RoundedRectangle(cornerRadius: 2))
+                            }
+                            .frame(maxWidth: .infinity, maxHeight: plotHeight)
+                        }
+                    }
+                    .frame(height: plotHeight)
+                    .overlay(alignment: .bottom) {
+                        Rectangle()
+                            .fill(Color.secondary.opacity(0.25))
+                            .frame(height: 1)
+                    }
+
+                    HStack(spacing: 0) {
+                        ForEach(Array(days.enumerated()), id: \.element) { index, day in
+                            Text(index % axisStride == 0 ? Self.dayLabel(for: day) : "")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity)
+                        }
+                    }
+                    .frame(height: 18)
+                }
+            }
+        }
+    }
+
+    private func seconds(for day: Date, domain: String) -> TimeInterval {
+        totalsByDayAndDomain["\(StatsDate.dayKey(for: day))|\(domain)"] ?? 0
+    }
+
+    private static func dayLabel(for date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M/d"
+        return formatter.string(from: date)
     }
 }
 
