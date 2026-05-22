@@ -321,7 +321,28 @@ final class BraveTracker: ObservableObject {
     }
 
     func chartDomains(for range: StatsRange) -> [String] {
-        rankedSites(for: range).map(\.domain)
+        rankedSites(for: range).prefix(6).map(\.domain)
+    }
+
+    func recentSites(for range: StatsRange) -> [SiteRecord] {
+        records(for: range)
+            .reduce(into: [String: SiteRecord]()) { result, record in
+                let existing = result[record.domain]
+                let current = SiteRecord(
+                    domain: record.domain,
+                    seconds: (existing?.seconds ?? 0) + record.seconds,
+                    visits: (existing?.visits ?? 0) + record.visits,
+                    lastSeen: max(existing?.lastSeen ?? .distantPast, record.lastSeen)
+                )
+                result[record.domain] = current
+            }
+            .values
+            .sorted {
+                if $0.lastSeen == $1.lastSeen {
+                    return $0.seconds > $1.seconds
+                }
+                return $0.lastSeen > $1.lastSeen
+            }
     }
 
     func totalSeconds(for range: StatsRange) -> TimeInterval {
@@ -947,6 +968,7 @@ struct MenuStatsSection: View {
     @EnvironmentObject private var tracker: BraveTracker
     @Binding var selectedRange: StatsRange
     @State private var exportMessage: String?
+    @State private var showingAllTopWebsites = false
 
     private var rangeSites: [SiteRecord] {
         tracker.rankedSites(for: selectedRange)
@@ -1047,9 +1069,15 @@ struct MenuStatsSection: View {
                         .lineLimit(2)
                 }
 
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Top Websites")
-                        .font(.subheadline.weight(.semibold))
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("Top Websites")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text("Max 20")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
 
                     if rangeSites.isEmpty {
                         Text("No data for this range")
@@ -1059,11 +1087,52 @@ struct MenuStatsSection: View {
                             .padding(.vertical, 8)
                     } else {
                         VStack(spacing: 8) {
-                            ForEach(Array(rangeSites.prefix(4).enumerated()), id: \.element.domain) { index, site in
+                            ForEach(Array(rangeSites.prefix(showingAllTopWebsites ? 20 : 10).enumerated()), id: \.element.domain) { index, site in
                                 SiteRow(
                                     rank: index + 1,
                                     site: site,
                                     maxSeconds: max(1, rangeSites.first?.seconds ?? 1),
+                                    swatch: DomainPalette.color(for: site.domain)
+                                )
+                            }
+                        }
+
+                        if rangeSites.count > 10 {
+                            Button {
+                                showingAllTopWebsites.toggle()
+                            } label: {
+                                Text(showingAllTopWebsites ? "Show less" : "Show more")
+                            }
+                            .buttonStyle(.plain)
+                            .font(.caption.weight(.semibold))
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("Recently Visited")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text("Max 6")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    let recentSites = tracker.recentSites(for: selectedRange)
+
+                    if recentSites.isEmpty {
+                        Text("No recent visits for this range")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 8)
+                    } else {
+                        VStack(spacing: 8) {
+                            ForEach(Array(recentSites.prefix(6).enumerated()), id: \.element.domain) { index, site in
+                                RecentSiteRow(
+                                    rank: index + 1,
+                                    site: site,
                                     swatch: DomainPalette.color(for: site.domain)
                                 )
                             }
@@ -1112,6 +1181,37 @@ struct SiteRow: View {
             }
             ProgressView(value: site.seconds / maxSeconds)
                 .progressViewStyle(.linear)
+        }
+    }
+}
+
+struct RecentSiteRow: View {
+    let rank: Int
+    let site: SiteRecord
+    let swatch: Color
+
+    private static let formatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter
+    }()
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(swatch)
+                .frame(width: 8, height: 8)
+            Text("\(rank)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 18, alignment: .trailing)
+            Text(site.domain)
+                .font(.callout.weight(.medium))
+                .lineLimit(1)
+            Spacer()
+            Text(Self.formatter.localizedString(for: site.lastSeen, relativeTo: Date()))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
         }
     }
 }
