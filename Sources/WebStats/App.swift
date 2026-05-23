@@ -130,14 +130,29 @@ struct DailyDomainTotal: Identifiable, Equatable {
 }
 
 enum StatsRange: Int, CaseIterable, Identifiable {
+    case today = 1
     case seven = 7
     case thirty = 30
     case sixty = 60
 
     var id: Int { rawValue }
     var days: Int { rawValue }
-    var title: String { "\(rawValue) days" }
-    var exportName: String { "\(rawValue)-days" }
+    var title: String {
+        switch self {
+        case .today:
+            return "Today"
+        case .seven, .thirty, .sixty:
+            return "\(rawValue) days"
+        }
+    }
+    var exportName: String {
+        switch self {
+        case .today:
+            return "today"
+        case .seven, .thirty, .sixty:
+            return "\(rawValue)-days"
+        }
+    }
 }
 
 enum StatsExportResult {
@@ -860,7 +875,7 @@ enum BraveAppleScript {
 struct MenuBarDashboard: View {
     @EnvironmentObject private var tracker: BraveTracker
     @State private var showingResetAlert = false
-    @State private var selectedRange: StatsRange = .seven
+    @State private var selectedRange: StatsRange = .today
 
     var body: some View {
         VStack(spacing: 0) {
@@ -980,6 +995,8 @@ struct MenuStatsSection: View {
 
     private var axisStride: Int {
         switch selectedRange {
+        case .today:
+            return 1
         case .seven:
             return 1
         case .thirty:
@@ -996,7 +1013,7 @@ struct MenuStatsSection: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("History")
                             .font(.subheadline.weight(.semibold))
-                        Text("7, 30, 60 day view")
+                        Text("Today, 7, 30, 60 day view")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -1012,6 +1029,7 @@ struct MenuStatsSection: View {
                 }
 
                 Picker("Range", selection: $selectedRange) {
+                    Text("Today").tag(StatsRange.today)
                     Text("7 days").tag(StatsRange.seven)
                     Text("30 days").tag(StatsRange.thirty)
                     Text("60 days").tag(StatsRange.sixty)

@@ -8,7 +8,7 @@ It polls Brave's active tab URL every 5 seconds, only counts time while Brave is
 ~/Library/Application Support/web-stats/stats-history.json
 ```
 
-The menu panel includes 7-day, 30-day, and 60-day chart tabs, plus a CSV export button for the selected range.
+The menu panel includes Today, 7-day, 30-day, and 60-day chart tabs, plus a CSV export button for the selected range.
 The chart only shows the top 6 domains per range, the top websites list caps at 20, and recent visits caps at 6.
 
 ## Run during development
