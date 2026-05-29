@@ -1245,6 +1245,8 @@ struct DomainBarChart: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 2))
                             }
                             .frame(maxWidth: .infinity, maxHeight: plotHeight)
+                            .contentShape(Rectangle())
+                            .help(tooltipText(for: day))
                         }
                     }
                     .frame(height: plotHeight)
@@ -1277,6 +1279,39 @@ struct DomainBarChart: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "M/d"
         return formatter.string(from: date)
+    }
+
+    private static let tooltipDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter
+    }()
+
+    private func tooltipText(for day: Date) -> String {
+        let rows = domains.compactMap { domain -> String? in
+            let seconds = seconds(for: day, domain: domain)
+            guard seconds > 0 else { return nil }
+            return "\(domain): \(Self.hourString(from: seconds))"
+        }
+
+        let totalSeconds = domains.reduce(0) { $0 + seconds(for: day, domain: $1) }
+        var lines = [
+            Self.tooltipDateFormatter.string(from: day),
+            "Total: \(Self.hourString(from: totalSeconds))"
+        ]
+
+        if rows.isEmpty {
+            lines.append("No tracked time")
+        } else {
+            lines.append(contentsOf: rows)
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    private static func hourString(from seconds: TimeInterval) -> String {
+        String(format: "%.2f h", seconds / 3600)
     }
 }
 
