@@ -217,6 +217,7 @@ final class BraveTracker: ObservableObject {
     @Published private(set) var dailyRecords: [DailySiteRecord] = []
     @Published private(set) var currentURL: String?
     @Published private(set) var currentDomain: String?
+    @Published private(set) var currentIgnoredDomain: String?
     @Published private(set) var isTracking = false
     @Published private(set) var lastError: String?
 
@@ -230,6 +231,9 @@ final class BraveTracker: ObservableObject {
     private var hasUnsavedChanges = false
 
     private static let braveBundleIdentifier = "com.brave.Browser"
+    private static let ignoredSiteDomains: Set<String> = [
+        "music.youtube.com"
+    ]
 
     init() {
         do {
@@ -272,6 +276,7 @@ final class BraveTracker: ObservableObject {
         isTracking = false
         previousDomain = nil
         currentDomain = nil
+        currentIgnoredDomain = nil
         currentURL = nil
     }
 
@@ -280,6 +285,7 @@ final class BraveTracker: ObservableObject {
         dailyRecords.removeAll()
         previousDomain = nil
         currentDomain = nil
+        currentIgnoredDomain = nil
         currentURL = nil
         lastError = nil
         hasUnsavedChanges = true
@@ -291,7 +297,7 @@ final class BraveTracker: ObservableObject {
     }
 
     var rankedSites: [SiteRecord] {
-        sites.sorted {
+        sites.filter { !Self.isIgnoredDomain($0.domain) }.sorted {
             if $0.seconds == $1.seconds {
                 return $0.domain < $1.domain
             }
@@ -300,11 +306,15 @@ final class BraveTracker: ObservableObject {
     }
 
     var totalSeconds: TimeInterval {
-        sites.reduce(0) { $0 + $1.seconds }
+        sites.filter { !Self.isIgnoredDomain($0.domain) }.reduce(0) { $0 + $1.seconds }
     }
 
     var historyFileURL: URL {
         storeURL
+    }
+
+    var ignoredDomains: [String] {
+        Self.ignoredSiteDomains.sorted()
     }
 
     func dailyTotals(for range: StatsRange) -> [DailyTotal] {
@@ -402,6 +412,7 @@ final class BraveTracker: ObservableObject {
         guard braveIsFrontmost else {
             previousDomain = nil
             currentDomain = nil
+            currentIgnoredDomain = nil
             currentURL = nil
             lastError = nil
             saveIfNeeded()
@@ -412,17 +423,25 @@ final class BraveTracker: ObservableObject {
             let url = try BraveAppleScript.activeTabURL()
             let activeDomain = Self.domain(from: url)
             currentURL = url
+            guard let activeDomain, !Self.isIgnoredDomain(activeDomain) else {
+                currentDomain = nil
+                currentIgnoredDomain = activeDomain
+                previousDomain = nil
+                lastError = nil
+                pruneHistory()
+                saveIfNeeded()
+                return
+            }
             currentDomain = activeDomain
-            if let activeDomain, activeDomain != previousDomain {
+            if activeDomain != previousDomain {
                 countVisit(to: activeDomain, at: now)
             }
             previousDomain = activeDomain
-            if activeDomain != nil {
-                lastError = nil
-            }
+            lastError = nil
         } catch {
             currentURL = nil
             currentDomain = nil
+            currentIgnoredDomain = nil
             previousDomain = nil
             lastError = error.localizedDescription
         }
@@ -432,7 +451,7 @@ final class BraveTracker: ObservableObject {
     }
 
     private func addTime(_ seconds: TimeInterval, to domain: String, at date: Date) {
-        guard seconds > 0 else { return }
+        guard seconds > 0, !Self.isIgnoredDomain(domain) else { return }
 
         if let index = sites.firstIndex(where: { $0.domain == domain }) {
             sites[index].seconds += seconds
@@ -445,6 +464,8 @@ final class BraveTracker: ObservableObject {
     }
 
     private func countVisit(to domain: String, at date: Date) {
+        guard !Self.isIgnoredDomain(domain) else { return }
+
         if let index = sites.firstIndex(where: { $0.domain == domain }) {
             sites[index].visits += 1
             sites[index].lastSeen = date
@@ -472,6 +493,10 @@ final class BraveTracker: ObservableObject {
             host.removeFirst(4)
         }
         return host.isEmpty ? nil : host
+    }
+
+    private static func isIgnoredDomain(_ domain: String) -> Bool {
+        ignoredSiteDomains.contains(domain)
     }
 
     private func installActivationObserver() {
@@ -505,6 +530,7 @@ final class BraveTracker: ObservableObject {
         lastTick = now
         previousDomain = nil
         currentDomain = nil
+        currentIgnoredDomain = nil
         currentURL = nil
         lastError = nil
         saveIfNeeded()
@@ -549,13 +575,15 @@ final class BraveTracker: ObservableObject {
     private func records(for range: StatsRange) -> [DailySiteRecord] {
         let start = StatsDate.startDate(for: range)
         return dailyRecords.filter { record in
+            guard !Self.isIgnoredDomain(record.domain) else { return false }
             guard let date = StatsDate.date(from: record.day) else { return false }
             return date >= start
         }
     }
 
     private func aggregateSites(from records: [DailySiteRecord]) -> [SiteRecord] {
-        Dictionary(grouping: records, by: \.domain).map { domain, records in
+        let trackedRecords = records.filter { !Self.isIgnoredDomain($0.domain) }
+        return Dictionary(grouping: trackedRecords, by: \.domain).map { domain, records in
             SiteRecord(
                 domain: domain,
                 seconds: records.reduce(0) { $0 + $1.seconds },
@@ -943,6 +971,9 @@ struct MenuHeaderView: View {
         if let error = tracker.lastError {
             return error
         }
+        if let domain = tracker.currentIgnoredDomain {
+            return "Ignoring \(domain)"
+        }
         if let domain = tracker.currentDomain {
             return "Tracking \(domain)"
         }
@@ -968,10 +999,17 @@ struct MenuSummary: View {
                 StatBlock(title: "Tracked Sites", value: "\(tracker.sites.count)")
                 StatBlock(title: "Total Time", value: DurationFormatter.string(from: tracker.totalSeconds))
                 StatBlock(title: "Top Site", value: tracker.rankedSites.first?.domain ?? "None")
-                StatBlock(title: "Current Site", value: tracker.currentDomain ?? "None")
+                StatBlock(title: "Current Site", value: currentSiteText)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var currentSiteText: String {
+        if let ignoredDomain = tracker.currentIgnoredDomain {
+            return "Ignored: \(ignoredDomain)"
+        }
+        return tracker.currentDomain ?? "None"
     }
 }
 
@@ -1377,6 +1415,20 @@ struct MenuSettingsCard: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(3)
                     .textSelection(.enabled)
+
+                if !tracker.ignoredDomains.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Ignored Sites")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        ForEach(tracker.ignoredDomains, id: \.self) { domain in
+                            Text(domain)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
 
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
